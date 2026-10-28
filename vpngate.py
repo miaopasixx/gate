@@ -52,6 +52,7 @@ CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 CHECK_MODE = os.environ.get("CHECK_MODE", "auto").strip().lower()
+NODES_FORMAT = os.environ.get("NODES_FORMAT", "ip").strip().lower()
 PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "8"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
@@ -509,15 +510,48 @@ def build_outputs(results, raw_count, sstp_count, source):
     }
     return data
 
+_EDGE_IP_CACHE = {}
+
+
+def resolve_edge_entry(entry):
+    """把 '域名:443' 解析成 'IP:443'，解析失败原样返回"""
+    if not entry:
+        return entry
+    host, port = entry, "443"
+    if ":" in entry:
+        head, tail = entry.rsplit(":", 1)
+        if tail.isdigit():
+            host, port = head, tail
+    if host in _EDGE_IP_CACHE:
+        ip = _EDGE_IP_CACHE[host]
+    else:
+        try:
+            ip = socket.gethostbyname(host)
+        except Exception:
+            ip = host
+        _EDGE_IP_CACHE[host] = ip
+    return f"{ip}:{port}"
+
+
 def build_nodes_text(data, edge_hosts):
     """
-    生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://...
+    生成 edgetunnel「自定义优选IP」可用的列表。
 
-    兜底: 没有任何可用节点时退化为纯优选域名列表 (每行 = 入口地址#标签),
-    保证 nodes.txt 永远非空, edgetunnel 不会拉到空文件。
+    NODES_FORMAT:
+      ip     (默认) 每行 = IP:端口#备注         <- 推荐, 避开 SNI 不匹配
+      host          每行 = 域名:端口#备注       <- 用原始域名
+      tunnel        每行 = 地址:端口#备注$sstp://vpn:vpn@host:port  <- 旧格式
+
+    注意: 优选入口只负责"替换 server 的 IP 层"，
+    servername / Host 必须保持你自己的 Worker 域名，否则 CF 边缘不会路由到你的 Worker。
     """
+    fmt = NODES_FORMAT if NODES_FORMAT in ("ip", "host", "tunnel") else "ip"
+
     countries = data.get("countries") or {}
     edge = [e for e in (edge_hosts or []) if e] or list(EDGE_HOSTS) or ["1.1.1.1:443"]
+    if fmt == "ip":
+        edge = [resolve_edge_entry(e) for e in edge]
+
     lines = []
     idx = 0
     ordered = sorted(
@@ -541,19 +575,22 @@ def build_nodes_text(data, edge_hosts):
         for i, n in enumerate(res_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            tail = f"$sstp://vpn:vpn@{n['host']}:{n['port']}" if fmt == "tunnel" else ""
+            lines.append(f"{entry}#{zh}-住宅-{i:02d}{tail}")
         for i, n in enumerate(dc_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            tail = f"$sstp://vpn:vpn@{n['host']}:{n['port']}" if fmt == "tunnel" else ""
+            lines.append(f"{entry}#{zh}-机房-{i:02d}{tail}")
 
-    # 兜底: 无可用节点时输出纯优选域名, 避免 edgetunnel 拉到空文件
+    # 兜底: 无可用节点时输出纯优选入口, 保证 nodes.txt 非空
     if not lines:
         for i, entry in enumerate(edge, 1):
             lines.append(f"{entry}#优选-{i:02d}")
-        log("NODES", f"[兜底] 无可用节点, nodes.txt 输出 {len(lines)} 条纯优选域名")
+        log("NODES", f"[兜底] 无可用节点, nodes.txt 输出 {len(lines)} 条优选入口")
 
     return "\n".join(lines) + "\n"
+
 
 def write_outputs(data, edge_hosts):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
@@ -588,6 +625,13 @@ def write_outputs(data, edge_hosts):
             log("NODES", f"  {ln}")
     except Exception:
         pass
+
+    # 纯 SSTP 节点列表: 给 SSTP 客户端用, 与 Cloudflare 完全无关
+    sstp_lines = [f"{n['host']}:{n['port']}" for n in (data.get("available") or [])]
+    sstp_path = os.path.join(PUBLIC_DIR, "sstp.txt")
+    with open(sstp_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(sstp_lines) + ("\n" if sstp_lines else ""))
+    log("NODES", f"sstp.txt: {len(sstp_lines)} 个 SSTP 节点 (与 Cloudflare 无关)")
 
     for p in (data_path, html_path, nodes_path):
         if not os.path.exists(p):
