@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +51,8 @@ CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
+CHECK_MODE = os.environ.get("CHECK_MODE", "auto").strip().lower()
+PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "8"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -378,7 +381,44 @@ def check_one(node, session):
         out["worker_error"] = True
         return out
 
-def check_all(nodes, session):
+def check_one_local(node):
+    """本地 TCP 直连探测: 连上 443 即认为 SSTP 枢纽存活"""
+    host = node["host"]
+    port = int(node["port"])
+    tmo = min(float(PROBE_TIMEOUT), float(CHECK_TIMEOUT))
+    out = dict(node)
+    out["protocol"] = "sstp"
+    out["link"] = f"sstp://vpn:vpn@{host}:{port}"
+    out["status"] = "failed"
+    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    out["exit"] = None
+    out["residential"] = "unknown"
+    out["probe"] = "tcp"
+    t0 = time.time()
+    try:
+        with socket.create_connection((host, port), timeout=tmo):
+            lat = int((time.time() - t0) * 1000)
+            out["success"] = True
+            out["status"] = "success"
+            out["latency_ms"] = lat
+            out["error"] = None
+            try:
+                out["residential"] = classify_network(host, None, None)
+            except Exception:
+                pass
+    except socket.timeout:
+        out["success"] = False
+        out["error"] = f"TCP超时({tmo:.0f}s)"
+    except OSError as exc:
+        out["success"] = False
+        out["error"] = f"OSError: {exc}"
+    except Exception as exc:
+        out["success"] = False
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _run_worker(nodes, session):
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         futures = [pool.submit(check_one, n, session) for n in nodes]
@@ -388,6 +428,48 @@ def check_all(nodes, session):
             except Exception as exc:
                 log("WARN", f"检测任务异常: {type(exc).__name__}: {exc}")
     return results
+
+
+def _run_local(nodes):
+    results = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = [pool.submit(check_one_local, n) for n in nodes]
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception as exc:
+                log("WARN", f"本地探测异常: {type(exc).__name__}: {exc}")
+    return results
+
+
+def check_all(nodes, session):
+    """
+    检测分发
+      CHECK_MODE=worker : 只走 Cloudflare Worker (fetch 探测, 对 SSTP 天然不可靠)
+      CHECK_MODE=local  : 只走本地 TCP 直连 (runner 有完整网络栈, 推荐)
+      CHECK_MODE=auto   : 先 Worker, 全失败自动降级 local (默认)
+    """
+    mode = CHECK_MODE if CHECK_MODE in ("worker", "local", "auto") else "auto"
+
+    if mode == "local" or not WORKER_CHECK_URL:
+        if not WORKER_CHECK_URL and mode != "local":
+            log("CHECK", "CHECK_WORKER 为空, 自动切换本地 TCP 直连")
+        log("CHECK", f"检测模式: 本地 TCP 直连 (并发 {CONCURRENCY}, 单次超时 {min(PROBE_TIMEOUT, CHECK_TIMEOUT):.0f}s)")
+        return _run_local(nodes)
+
+    if mode == "worker":
+        log("CHECK", f"检测模式: Cloudflare Worker (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT:.0f}s)")
+        return _run_worker(nodes, session)
+
+    # auto
+    log("CHECK", f"检测模式: auto — 先 Worker, 全失败再本地直连")
+    res = _run_worker(nodes, session)
+    ok = [r for r in res if r.get("success")]
+    werr = [r for r in res if not r.get("success") and r.get("worker_error")]
+    if res and not ok and len(werr) == len(res):
+        log("WARN", f"Worker 判定全部失败 ({len(werr)}/{len(res)}), 自动切换本地 TCP 直连重测")
+        return _run_local(nodes)
+    return res
 
 # ---------------------------------------------------------------------------
 # 生成数据
@@ -538,30 +620,12 @@ def main():
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
 
+    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)}")
     if WORKER_CHECK_URL:
-        log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
-        log("CLOUDFLARE WORKER", f"检测地址: {WORKER_CHECK_URL}<host>:<port>")
-        t0 = time.time()
-        results = check_all(uniq, session)
-        elapsed = time.time() - t0
-    else:
-        log("WARN", "CHECK_WORKER 未配置或为空, 跳过检测 (全部记为失败, 不影响产物生成)")
-        elapsed = 0.0
-        results = []
-        for n in uniq:
-            d = dict(n)
-            d.update({
-                "protocol": "sstp",
-                "link": f"sstp://vpn:vpn@{n['host']}:{n['port']}",
-                "status": "failed",
-                "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                "exit": None,
-                "residential": "unknown",
-                "success": False,
-                "worker_error": True,
-                "error": "WORKER_NOT_CONFIGURED",
-            })
-            results.append(d)
+        log("CLOUDFLARE WORKER", f"Worker 地址: {WORKER_CHECK_URL}<host>:<port>")
+    t0 = time.time()
+    results = check_all(uniq, session)
+    elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
