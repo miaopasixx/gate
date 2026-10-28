@@ -20,6 +20,10 @@ env:
   CHECK_PROTO: "sstp"
   CHECK_CONCURRENCY: "32"
   CHECK_TIMEOUT: "90"
+  # auto = 先 Worker，全失败自动切换本地 TCP 直连（推荐）
+  # worker = 只走 Worker / local = 只走本地直连
+  CHECK_MODE: "auto"
+  PROBE_TIMEOUT: "8"
   PUBLIC_DIR: "public"
 
 jobs:
@@ -109,6 +113,8 @@ jobs:
           CHECK_PROTO: ${{ env.CHECK_PROTO }}
           CHECK_CONCURRENCY: ${{ env.CHECK_CONCURRENCY }}
           CHECK_TIMEOUT: ${{ env.CHECK_TIMEOUT }}
+          CHECK_MODE: ${{ env.CHECK_MODE }}
+          PROBE_TIMEOUT: ${{ env.PROBE_TIMEOUT }}
           # 为空表示 Worker 不可用，脚本应降级为本地直连检测
           WORKER_OK: ${{ steps.doctor.outputs.worker_ok }}
           PUBLIC_DIR: ${{ env.PUBLIC_DIR }}
