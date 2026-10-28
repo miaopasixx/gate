@@ -41,7 +41,11 @@ VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
+WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@").strip()
+# 规范化: 允许只传 https://xxx/check, 自动补上 Worker 期望的查询串前缀
+if WORKER_CHECK_URL and "?" not in WORKER_CHECK_URL:
+    WORKER_CHECK_URL = WORKER_CHECK_URL.rstrip("/") + "?sstp=vpn:vpn@"
+
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
@@ -338,7 +342,12 @@ def check_one(node, session):
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
             return out
-        j = r.json()
+        try:
+            j = r.json()
+        except ValueError:
+            out["error"] = f"非JSON响应(可能是WAF/错误页): {r.text[:200]}"
+            out["worker_error"] = True
+            return out
         ok = bool(j.get("success"))
         out["success"] = ok
         out["status"] = "success" if ok else "failed"
@@ -374,7 +383,10 @@ def check_all(nodes, session):
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         futures = [pool.submit(check_one, n, session) for n in nodes]
         for fut in as_completed(futures):
-            results.append(fut.result())
+            try:
+                results.append(fut.result())
+            except Exception as exc:
+                log("WARN", f"检测任务异常: {type(exc).__name__}: {exc}")
     return results
 
 # ---------------------------------------------------------------------------
@@ -418,16 +430,30 @@ def build_outputs(results, raw_count, sstp_count, source):
 def build_nodes_text(data, edge_hosts):
     """
     生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://...
+
+    兜底: 没有任何可用节点时退化为纯优选域名列表 (每行 = 入口地址#标签),
+    保证 nodes.txt 永远非空, edgetunnel 不会拉到空文件。
     """
-    countries = data["countries"]
-    edge = edge_hosts
+    countries = data.get("countries") or {}
+    edge = [e for e in (edge_hosts or []) if e] or list(EDGE_HOSTS) or ["1.1.1.1:443"]
     lines = []
     idx = 0
-    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
+    ordered = sorted(
+        countries.items(),
+        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
+    )
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
+        nodes = sorted(
+            grp["nodes"],
+            key=lambda n: (
+                0 if n.get("residential") == "residential" else 1,
+                n.get("latency_ms") is None,
+                n.get("latency_ms") or 0,
+                n.get("host") or "",
+            ),
+        )
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
@@ -438,6 +464,13 @@ def build_nodes_text(data, edge_hosts):
             entry = edge[idx % len(edge)]
             idx += 1
             lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+
+    # 兜底: 无可用节点时输出纯优选域名, 避免 edgetunnel 拉到空文件
+    if not lines:
+        for i, entry in enumerate(edge, 1):
+            lines.append(f"{entry}#优选-{i:02d}")
+        log("NODES", f"[兜底] 无可用节点, nodes.txt 输出 {len(lines)} 条纯优选域名")
+
     return "\n".join(lines) + "\n"
 
 def write_outputs(data, edge_hosts):
@@ -459,9 +492,26 @@ def write_outputs(data, edge_hosts):
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
+    nodes_text = build_nodes_text(data, edge_hosts)
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data, edge_hosts))
+        f.write(nodes_text)
+
+    # 产物自检: 大小 + 行数 + 前 3 行, 直接打日志, 不用等部署完再猜
+    node_lines = nodes_text.splitlines()
+    try:
+        size = os.path.getsize(nodes_path)
+        log("NODES", f"nodes.txt: {size} bytes, {len(node_lines)} 行")
+        for ln in node_lines[:3]:
+            log("NODES", f"  {ln}")
+    except Exception:
+        pass
+
+    for p in (data_path, html_path, nodes_path):
+        if not os.path.exists(p):
+            log("WARN", f"产物未生成: {p}")
+        elif os.path.getsize(p) == 0:
+            log("WARN", f"产物为空: {p}")
 
     return data_path, html_path, nodes_path
 
@@ -488,34 +538,109 @@ def main():
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
 
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
-    t0 = time.time()
-    results = check_all(uniq, session)
-    elapsed = time.time() - t0
+    if WORKER_CHECK_URL:
+        log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
+        log("CLOUDFLARE WORKER", f"检测地址: {WORKER_CHECK_URL}<host>:<port>")
+        t0 = time.time()
+        results = check_all(uniq, session)
+        elapsed = time.time() - t0
+    else:
+        log("WARN", "CHECK_WORKER 未配置或为空, 跳过检测 (全部记为失败, 不影响产物生成)")
+        elapsed = 0.0
+        results = []
+        for n in uniq:
+            d = dict(n)
+            d.update({
+                "protocol": "sstp",
+                "link": f"sstp://vpn:vpn@{n['host']}:{n['port']}",
+                "status": "failed",
+                "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "exit": None,
+                "residential": "unknown",
+                "success": False,
+                "worker_error": True,
+                "error": "WORKER_NOT_CONFIGURED",
+            })
+            results.append(d)
 
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
     worker_errors = [r for r in failed if r.get("worker_error")]
 
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
+    if worker_errors:
+        log("CLOUDFLARE WORKER", f"检测失败: {len(failed)} (其中 Worker 异常 {len(worker_errors)})")
+    else:
+        log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}")
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
-    if uniq and not success and len(worker_errors) == len(uniq):
-        die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+    # Worker 异常分类统计 —— 之前 N 个异常全糊成一行, 看不到具体原因
+    if worker_errors:
+        buckets = {}
+        for r in worker_errors:
+            key = str(r.get("error") or "unknown")
+            if ":" in key:
+                key = key.split(":")[0][:60]
+            buckets[key] = buckets.get(key, 0) + 1
+        log("WORKER DIAG", f"Worker 异常分类 ({len(worker_errors)} 条):")
+        for k, v in sorted(buckets.items(), key=lambda kv: -kv[1]):
+            log("WORKER DIAG", f"  {v:>4d}  x  {k}")
+        s0 = worker_errors[0]
+        log("WORKER DIAG", f"样本错误: {s0.get('error')}")
+        try:
+            probe = WORKER_CHECK_URL + quote(f"{s0['host']}:{s0['port']}", safe="")
+            log("WORKER DIAG", f"实际请求地址: {probe}")
+        except Exception:
+            pass
 
-    data = build_outputs(results, raw_count, sstp_count, source)
+    # ==== 核心改动: 检测全挂不再中断流程 ====
+    # 原逻辑在这里 die(), 导致下面的 write_outputs() 永远不执行,
+    # public/ 为空 -> Pages 上传空目录 -> nodes.txt 404。
+    # nodes.txt 的数据源是优选域名, 跟 SSTP 检测结果无关, 不该被连累。
+    degraded = False
+    if uniq and not success and len(worker_errors) == len(uniq):
+        degraded = True
+        log("WARN", "Worker 全部请求异常 — 检测服务不可用")
+        log("WARN", "降级运行: 页面无可用节点, 但 nodes.txt / index.html 仍会正常生成")
+
+    try:
+        data = build_outputs(results, raw_count, sstp_count, source)
+    except Exception as exc:
+        log("WARN", f"build_outputs 异常: {type(exc).__name__}: {exc}")
+        log("WARN", "使用最小数据集继续, 保证产物不丢失")
+        data = {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "source": source,
+            "worker": WORKER_CHECK_URL,
+            "stats": {
+                "raw_nodes": raw_count,
+                "sstp_nodes": sstp_count,
+                "checked": len(results),
+                "success": 0,
+                "failed": len(results),
+                "countries": 0,
+                "residential_est": 0,
+                "datacenter_est": 0,
+            },
+            "countries": {},
+            "available": [],
+        }
+
     log("RESULT", f"可用节点: {len(success)}")
-    log("RESULT", f"国家数量: {data['stats']['countries']}")
+    log("RESULT", f"国家数量: {data.get('stats', {}).get('countries', 0)}")
 
     # 动态拉取 API 并与静态优选域名混合
-    edge_hosts = get_combined_edge_hosts()
+    edge_hosts = get_combined_edge_hosts() or list(EDGE_HOSTS)
+    if not edge_hosts:
+        log("WARN", "优选域名池为空, nodes.txt 将使用兜底格式")
 
     data_path, html_path, nodes_path = write_outputs(data, edge_hosts)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
     log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后自动更新)")
+    if degraded:
+        log("WARN", "本次为降级运行: 页面无可用节点, 但 nodes.txt 已正常产出")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
 if __name__ == "__main__":
