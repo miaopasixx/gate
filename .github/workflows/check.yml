@@ -24,6 +24,8 @@ env:
   # worker = 只走 Worker / local = 只走本地直连
   CHECK_MODE: "auto"
   PROBE_TIMEOUT: "8"
+  # nodes.txt 格式: ip(默认,纯IP最稳) / host(原始域名) / tunnel(旧格式带$sstp://)
+  NODES_FORMAT: "ip"
   PUBLIC_DIR: "public"
 
 jobs:
@@ -115,6 +117,7 @@ jobs:
           CHECK_TIMEOUT: ${{ env.CHECK_TIMEOUT }}
           CHECK_MODE: ${{ env.CHECK_MODE }}
           PROBE_TIMEOUT: ${{ env.PROBE_TIMEOUT }}
+          NODES_FORMAT: ${{ env.NODES_FORMAT }}
           # 为空表示 Worker 不可用，脚本应降级为本地直连检测
           WORKER_OK: ${{ steps.doctor.outputs.worker_ok }}
           PUBLIC_DIR: ${{ env.PUBLIC_DIR }}
