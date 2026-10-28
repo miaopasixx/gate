@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # 只写到 /check 为止，查询参数由脚本自行拼接
-  CHECK_WORKER_BASE: "https://ccf.mpsxx.cc.cd/check"
+  # 必须包含 Worker 期望的查询串前缀 ?sstp=vpn:vpn@，后面直接拼 <host>:<port>
+  CHECK_WORKER_BASE: "https://ccf.mpsxx.cc.cd/check?sstp=vpn:vpn@"
   CHECK_PROTO: "sstp"
   CHECK_CONCURRENCY: "32"
   CHECK_TIMEOUT: "90"
@@ -73,7 +73,8 @@ jobs:
             echo "DNS: FAIL"
           fi
 
-          PROBE_URL="${BASE}?proto=${CHECK_PROTO}&host=1.1.1.1&port=443"
+          # 按 Worker 真实协议构造: <base><host>%3A<port>
+          PROBE_URL="${BASE}1.1.1.1%3A443"
           CODE="000"
           for i in 1 2 3; do
             CODE="$(curl -sS --max-time 20 -o /tmp/probe.txt -w '%{http_code}' "${PROBE_URL}" 2>/dev/null || echo 000)"
