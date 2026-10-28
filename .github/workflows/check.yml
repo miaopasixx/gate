@@ -112,6 +112,28 @@ jobs:
           WORKER_OK: ${{ steps.doctor.outputs.worker_ok }}
           PUBLIC_DIR: ${{ env.PUBLIC_DIR }}
 
+      - name: Collect artifacts into public
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "${PUBLIC_DIR}"
+          echo "===== 搜索全仓库产物 ====="
+          find . -maxdepth 3 \
+            \( -name "nodes.txt" -o -name "nodes.json" -o -name "nodes.csv" \
+               -o -name "result.csv" -o -name "data.json" \) \
+            -not -path "./.git/*" -not -path "./${PUBLIC_DIR}/*" \
+            -print 2>/dev/null | head -50 || true
+
+          for f in nodes.txt nodes_sstp.txt nodes.json nodes.csv result.csv data.json; do
+            if [ -f "$f" ]; then
+              cp -v "$f" "${PUBLIC_DIR}/"
+            fi
+          done
+
+          echo "===== ${PUBLIC_DIR} 最终内容 ====="
+          ls -la "${PUBLIC_DIR}"
+
       - name: Ensure public dir + fallback page
         if: always()
         shell: bash
