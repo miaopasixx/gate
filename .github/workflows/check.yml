@@ -19,7 +19,7 @@ env:
   CHECK_PROTO: "sstp"
   CHECK_CONCURRENCY: "32"
   CHECK_TIMEOUT: "90"
-  CHECK_MODE: "worker"
+  CHECK_MODE: "auto"
   PROBE_TIMEOUT: "8"
   PUBLIC_DIR: "public"
 
