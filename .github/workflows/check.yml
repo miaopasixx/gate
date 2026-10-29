@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CHECK_WORKER_BASE: "https://ccf.mpsxx.cc.cd/check?sstp=vpn:vpn@"
+  CHECK_WORKER_BASE: "https://ccs.mpsxx.cc.cd/check?sstp=vpn:vpn@"
   CHECK_PROTO: "sstp"
   CHECK_CONCURRENCY: "32"
   CHECK_TIMEOUT: "90"
